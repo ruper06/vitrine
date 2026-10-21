@@ -3,17 +3,41 @@
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <string.h>
+#import <stdlib.h>
+#import <limits.h>
 #import "SGRebind.h"
 #import "SGLog.h"
 
+// YES when a loaded image is the app's own binary: the same path as the main bundle's executable, compared as
+// written and then resolved (/var and /private/var), the file name checked first so most images cost a strcmp.
+static BOOL isAppImage(const char *image, const char *app) {
+    if (!image || !app) return NO;
+    if (strcmp(image, app) == 0) return YES;
+    const char *imageName = strrchr(image, '/'), *appName = strrchr(app, '/');
+    if (!imageName || !appName || strcmp(imageName, appName) != 0) return NO;
+    char resolvedImage[PATH_MAX], resolvedApp[PATH_MAX];
+    return realpath(image, resolvedImage) && realpath(app, resolvedApp) && strcmp(resolvedImage, resolvedApp) == 0;
+}
+
+// The image Spotify's own code is in. Usually the main executable. LiveContainer runs an app by loading its
+// binary into LiveContainer's process as a dylib (its MH_EXECUTE turned into MH_DYLIB), so there the main
+// executable is LiveContainer's, which imports none of Spotify's audio calls: the image at the main bundle's
+// executable path, which LiveContainer points at the app, is taken first, the main executable otherwise.
 static const struct mach_header_64 *mainExecutable(intptr_t *slide) {
+    const char *app = NSBundle.mainBundle.executablePath.fileSystemRepresentation;
+    int64_t executable = -1;
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const struct mach_header *header = _dyld_get_image_header(i);
-        if (header->magic != MH_MAGIC_64 || header->filetype != MH_EXECUTE) continue;
-        *slide = _dyld_get_image_vmaddr_slide(i);
-        return (const struct mach_header_64 *)header;
+        if (!header || header->magic != MH_MAGIC_64) continue;
+        if ((header->filetype == MH_DYLIB || header->filetype == MH_EXECUTE) && isAppImage(_dyld_get_image_name(i), app)) {
+            *slide = _dyld_get_image_vmaddr_slide(i);
+            return (const struct mach_header_64 *)header;
+        }
+        if (header->filetype == MH_EXECUTE && executable < 0) executable = i;
     }
-    return NULL;
+    if (executable < 0) return NULL;
+    *slide = _dyld_get_image_vmaddr_slide((uint32_t)executable);
+    return (const struct mach_header_64 *)_dyld_get_image_header((uint32_t)executable);
 }
 
 // Writes one pointer, making its page writable first; a page dyld made read only after binding
